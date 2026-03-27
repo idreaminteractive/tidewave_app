@@ -30,6 +30,9 @@ pub struct Config {
 
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+
+    #[serde(default)]
+    pub ipv6_host: Option<String>,
 }
 
 fn default_port() -> u16 {
@@ -44,6 +47,7 @@ impl Default for Config {
             allow_remote_access: false,
             https_port: None,
             https_cert_path: None,
+            ipv6_host: None,
             https_key_path: None,
             env: HashMap::new(),
             allowed_origins: Vec::new(),

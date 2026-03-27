@@ -224,11 +224,31 @@ pub async fn start_http_server(
     serve_http_server_with_shutdown(config, std::future::pending()).await
 }
 
-fn get_bind_addr(port: u16, allow_remote_access: bool) -> std::net::SocketAddr {
-    let ip = if allow_remote_access {
-        std::net::Ipv4Addr::UNSPECIFIED
+fn get_bind_addr(
+    port: u16,
+    allow_remote_access: bool,
+    ipv6_host: Option<&str>,
+) -> std::net::SocketAddr {
+    use std::net::IpAddr;
+
+    if let Some(h) = ipv6_host {
+        // Strip URL-style brackets from IPv6 literals: [::1] -> ::1
+        let h = h.trim_matches(|c| c == '[' || c == ']');
+        match h.parse::<IpAddr>() {
+            Ok(ip) => {
+                info!("Binding to ipv6_host: {}", ip);
+                return std::net::SocketAddr::from((ip, port));
+            }
+            Err(_) => {
+                error!("Invalid --ipv6-host value '{}', falling back to default", h);
+            }
+        }
+    }
+
+    let ip: IpAddr = if allow_remote_access {
+        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
     } else {
-        std::net::Ipv4Addr::LOCALHOST
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     };
     std::net::SocketAddr::from((ip, port))
 }
@@ -262,7 +282,11 @@ async fn serve_http_server_inner(
         .no_brotli()
         .build()?;
 
-    let http_addr = get_bind_addr(config.port, config.allow_remote_access);
+    let http_addr = get_bind_addr(
+        config.port,
+        config.allow_remote_access,
+        config.ipv6_host.as_deref(),
+    );
     let http_handle = axum_server::Handle::new();
 
     // Determine the port - if listener provided, use its port; otherwise use config
@@ -408,7 +432,8 @@ async fn serve_http_server_inner(
             .expect("https_key_path validated");
         let rustls_config = load_tls_config_from_paths(cert_path, key_path)?;
 
-        let https_addr = get_bind_addr(https_port, config.allow_remote_access);
+        // Ignore the ipv6 host when doing https
+        let https_addr = get_bind_addr(https_port, config.allow_remote_access, None);
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(rustls_config);
         let https_handle = axum_server::Handle::new();
         let https_handle_clone = https_handle.clone();
@@ -1116,6 +1141,49 @@ async fn check_origin_handler(req: Request) -> Result<Json<CheckOriginResponse>,
     let valid = is_valid_origin(&req, config);
 
     Ok(Json(CheckOriginResponse { valid }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn test_bind_addr_default() {
+        let addr = get_bind_addr(9832, false, None);
+        assert_eq!(addr, SocketAddr::from((Ipv4Addr::LOCALHOST, 9832)));
+    }
+
+    #[test]
+    fn test_bind_addr_remote_access() {
+        let addr = get_bind_addr(9832, true, None);
+        assert_eq!(addr, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 9832)));
+    }
+
+    #[test]
+    fn test_bind_addr_ipv6_literal() {
+        let addr = get_bind_addr(9832, false, Some("::1"));
+        assert_eq!(addr, SocketAddr::from((Ipv6Addr::LOCALHOST, 9832)));
+    }
+
+    #[test]
+    fn test_bind_addr_ipv6_brackets() {
+        let addr = get_bind_addr(9832, false, Some("[::1]"));
+        assert_eq!(addr, SocketAddr::from((Ipv6Addr::LOCALHOST, 9832)));
+    }
+
+    #[test]
+    fn test_bind_addr_ipv6_overrides_allow_remote() {
+        let addr = get_bind_addr(9832, true, Some("::1"));
+        assert_eq!(addr, SocketAddr::from((Ipv6Addr::LOCALHOST, 9832)));
+    }
+
+    #[test]
+    fn test_bind_addr_invalid_host_fallback() {
+        // Invalid host should log an error and fall back to localhost
+        let addr = get_bind_addr(9832, false, Some("not-an-ip"));
+        assert_eq!(addr, SocketAddr::from((Ipv4Addr::LOCALHOST, 9832)));
+    }
 }
 
 async fn root(_req: Request) -> Html<String> {

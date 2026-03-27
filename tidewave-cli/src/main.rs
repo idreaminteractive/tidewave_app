@@ -14,6 +14,9 @@ struct Cli {
     allow_remote_access: bool,
 
     #[arg(long)]
+    ipv6_host: Option<String>,
+
+    #[arg(long)]
     https_port: Option<u16>,
 
     #[arg(long)]
@@ -34,6 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         port: cli.port.unwrap_or(9832),
         debug: cli.debug,
         allow_remote_access: cli.allow_remote_access,
+        ipv6_host: cli.ipv6_host,
         https_port: cli.https_port,
         https_cert_path: cli.https_cert_path,
         https_key_path: cli.https_key_path,
