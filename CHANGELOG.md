@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.1 (2026-04-27)
+
+* Add routes for /stat and /listdir
+* Provide a POST version for /about and /download
+
+## v0.4.0 (2026-03-27)
+
+* Add channel for video mode recordings
+* Remove old ACP WebSocket code
+
 ## v0.3.8 (2026-03-19)
 
 * Add support for extracting full archives (required for some future ACP integrations)

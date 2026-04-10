@@ -1,14 +1,16 @@
-use crate::command::{create_shell_command, spawn_command};
+use crate::command::{create_cmd_command, create_shell_command, spawn_command, ChildProcess};
 use crate::config::Config;
 use crate::http_handlers::{client_proxy_handler, download_handler, proxy_handler, DownloadState};
-use crate::utils::{load_tls_config_from_paths, normalize_path, wslpath_to_windows};
+use crate::utils::{
+    load_tls_config_from_paths, normalize_path, recordings_dir, wslpath_to_windows,
+};
 use axum::{
     body::{Body, Bytes},
     extract::{Json, Query, Request},
     http::{header, StatusCode},
     middleware,
     response::{Html, Response},
-    routing::{get, post},
+    routing::{any, get, post},
     Router,
 };
 use bytes::BytesMut;
@@ -22,13 +24,26 @@ use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tower_http::services::ServeDir;
 use tracing::{debug, error, info};
 use which;
 
 #[derive(Deserialize)]
 struct ShellParams {
     command: String,
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
+}
+
+#[derive(Deserialize)]
+struct CmdParams {
+    command: String,
+    args: Option<Vec<String>>,
+    input: Option<String>,
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
     #[serde(default)]
@@ -96,6 +111,13 @@ struct WhichParams {
     #[serde(default)]
     #[allow(dead_code)]
     is_wsl: bool,
+}
+
+#[derive(Deserialize)]
+struct OpenParams {
+    path: String,
+    #[serde(default)]
+    reveal: bool,
 }
 
 #[derive(Deserialize)]
@@ -204,6 +226,7 @@ struct AboutResponse {
     version: String,
     system: SystemInfo,
     cache_dir: String,
+    recordings_dir: String,
 }
 
 #[derive(Serialize)]
@@ -297,8 +320,6 @@ async fn serve_http_server_inner(
     };
 
     let https_port = config.https_port;
-    let mcp_state = crate::mcp_remote::McpRemoteState::new();
-    let acp_state = crate::acp_proxy::AcpProxyState::new();
     let download_state = DownloadState::new();
 
     // Build allowed origins for both HTTP and HTTPS
@@ -318,31 +339,13 @@ async fn serve_http_server_inner(
         https_port,
     };
 
-    // Create the MCP routes that need state
-    // TODO: remove on 0.4.0
-    let mcp_routes = Router::new()
-        .route(
-            "/acp/mcp-remote",
-            get(crate::mcp_remote::mcp_remote_ws_handler),
-        )
-        .route(
-            "/acp/mcp-remote-client",
-            post(crate::mcp_remote::mcp_remote_client_handler),
-        )
-        .with_state(mcp_state);
-
-    // Create ACP routes
-    // TODO: remove on 0.4.0
-    let acp_routes = Router::new()
-        .route("/acp/ws", get(crate::acp_proxy::acp_ws_handler))
-        .with_state(acp_state.clone());
-
     // Create download routes
     let client_for_download = client.clone();
     let download_routes = Router::new()
         .route(
             "/download",
-            get(move |params, state| {
+            // TODO: convert to POST
+            any(move |params, state| {
                 let client = client_for_download.clone();
                 download_handler(params, state, client)
             }),
@@ -370,17 +373,25 @@ async fn serve_http_server_inner(
     // Create the main app without state
     let client_for_proxy = client.clone();
     let mut app = Router::new()
-        .route("/", get(root))
-        .route("/about", get(about))
+        .route("/", get(root_handler))
+        .route("/manifest.json", get(manifest_json_handler))
+        .route("/sw.js", get(service_worker_handler))
+        .route("/icon-192.png", get(icon_192_handler))
+        .route("/icon-512.png", get(icon_512_handler))
+        // TODO: remove deprecated GET
+        .route("/about", get(about_handler).post(about_handler))
+        .route("/stat", get(stat_handler).post(stat_handler))
+        .route("/listdir", get(listdir_handler).post(listdir_handler))
+        // Always use POST routes so it triggers origin checks
         .route("/check-origin", post(check_origin_handler))
         .route("/read", post(read_file_handler))
         .route("/write", post(write_file_handler))
         .route("/delete", post(delete_file_handler))
-        .route("/stat", get(stat_handler))
-        .route("/listdir", get(listdir_handler))
         .route("/mkdir", post(mkdir_handler))
         .route("/shell", post(shell_handler))
+        .route("/cmd", post(cmd_handler))
         .route("/which", post(which_handler))
+        .route("/open", post(open_handler))
         .route(
             "/proxy",
             axum::routing::any(move |params, req| {
@@ -388,8 +399,7 @@ async fn serve_http_server_inner(
                 proxy_handler(params, req, client)
             }),
         )
-        .merge(mcp_routes) // TODO: remove on 0.4.0
-        .merge(acp_routes) // TODO: remove on 0.4.0
+        .nest_service("/recordings", ServeDir::new(recordings_dir()))
         .merge(download_routes)
         .merge(ws_routes)
         .merge(mcp_channel_post_routes);
@@ -494,20 +504,6 @@ async fn serve_http_server_inner(
     }
     http_result??;
 
-    // TODO: remove on 0.4.0 since ACP cleanup is handled in ws_state.clear()
-    // Kill all ACP processes via their exit channels.
-    // Note: We use the exit_tx channel instead of directly killing, because
-    // the exit monitor task holds the child write lock while waiting.
-    let acp_process_count = acp_state.processes.len();
-    debug!("Found {} ACP processes to clean up", acp_process_count);
-
-    for entry in acp_state.processes.iter() {
-        let process_state = entry.value();
-        if let Some(exit_tx) = process_state.exit_tx.read().await.as_ref() {
-            let _ = exit_tx.send(());
-        }
-    }
-
     // Clear all WebSocket state (includes ACP channel process cleanup)
     ws_state.clear().await;
 
@@ -563,9 +559,9 @@ async fn verify_origin(
     req: Request,
     next: axum::middleware::Next,
 ) -> Result<Response<Body>, StatusCode> {
-    // Skip origin verification for /about and /check-origin routes
+    // Skip origin verification for /check-origin routes
     let path = req.uri().path();
-    if path == "/about" || path == "/check-origin" {
+    if path == "/check-origin" {
         return Ok(next.run(req).await);
     }
 
@@ -606,11 +602,51 @@ async fn shell_handler(
     let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
 
     let mut command = create_shell_command(&payload.command, env, &cwd, payload.is_wsl);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let process = spawn_command(command)
+        .map_err(|e| shell_error(&format!("Failed to spawn command: {}", e)))?;
+
+    stream_process_response(process)
+}
+
+async fn cmd_handler(
+    Json(payload): Json<CmdParams>,
+) -> Result<Response<Body>, (StatusCode, Json<ShellError>)> {
+    let cwd = payload.cwd.unwrap_or(".".to_string());
+    let env = payload.env.unwrap_or_else(|| std::env::vars().collect());
+    let args = payload.args.unwrap_or_default();
+
+    let mut command = create_cmd_command(&payload.command, &args, env, &cwd, payload.is_wsl);
+    command
+        .stdin(if payload.input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let mut process = spawn_command(command)
         .map_err(|e| shell_error(&format!("Failed to spawn command: {}", e)))?;
 
+    if let Some(input) = payload.input {
+        if let Some(mut stdin) = process.child.stdin.take() {
+            tokio::spawn(async move {
+                let _ = stdin.write_all(input.as_bytes()).await;
+            });
+        }
+    }
+
+    stream_process_response(process)
+}
+
+fn stream_process_response(
+    mut process: ChildProcess,
+) -> Result<Response<Body>, (StatusCode, Json<ShellError>)> {
     let mut stdout = Some(
         process
             .child
@@ -658,7 +694,7 @@ async fn shell_handler(
         }
 
         // Take the process to wait on it (prevents Drop from killing it since process completed normally)
-        let process_opt = _process_holder.lock().ok().and_then(|mut g| g.take());
+        let process_opt = _process_holder.lock().ok().and_then(|mut g: std::sync::MutexGuard<Option<ChildProcess>>| g.take());
         let status = if let Some(mut process) = process_opt {
             match process.child.wait().await {
                 Ok(status) => Some(status.code().unwrap_or(-1)),
@@ -678,11 +714,11 @@ async fn shell_handler(
 
     let body = Body::from_stream(stream);
 
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/octet-stream")
         .body(body)
-        .map_err(|e| shell_error(&format!("Failed to build response: {}", e)))?)
+        .map_err(|e| shell_error(&format!("Failed to build response: {}", e)))
 }
 
 fn create_data_chunk(data: &[u8]) -> Bytes {
@@ -842,6 +878,99 @@ async fn delete_file_handler(
             error: error.kind().to_string(),
         })),
     }
+}
+
+async fn open_handler(Json(payload): Json<OpenParams>) -> Result<StatusCode, StatusCode> {
+    let path = Path::new(&payload.path);
+
+    if !path.exists() {
+        error!("Open: path does not exist: {}", payload.path);
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    #[cfg(target_os = "windows")]
+    let path_str = path
+        .canonicalize()
+        .map_err(|e| {
+            error!("Open: failed to canonicalize path: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(not(target_os = "windows"))]
+    let path_str = &payload.path;
+
+    let spawn_result = if payload.reveal {
+        #[cfg(target_os = "macos")]
+        {
+            crate::command::command_with_limited_env("open")
+                .arg("-R")
+                .arg(path_str)
+                .spawn()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            crate::command::command_with_limited_env("explorer.exe")
+                .raw_arg(format!("/select,\"{}\"", path_str))
+                .spawn()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if env::var("WSL_DISTRO_NAME").is_ok() {
+                let win_path = wslpath_to_windows(&payload.path).await.map_err(|e| {
+                    error!("Open: wslpath failed: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+                crate::command::command_with_limited_env("explorer.exe")
+                    .arg(format!("/select,{}", win_path))
+                    .spawn()
+            } else {
+                let open_path = if path.is_file() {
+                    path.parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or(payload.path.clone())
+                } else {
+                    payload.path.clone()
+                };
+                crate::command::command_with_limited_env("xdg-open")
+                    .arg(&open_path)
+                    .spawn()
+            }
+        }
+    } else {
+        #[cfg(target_os = "macos")]
+        let program = "open";
+        #[cfg(target_os = "linux")]
+        let program = "xdg-open";
+        #[cfg(target_os = "windows")]
+        let program = "explorer.exe";
+
+        #[cfg(target_os = "linux")]
+        if env::var("WSL_DISTRO_NAME").is_ok() {
+            let win_path = wslpath_to_windows(&payload.path).await.map_err(|e| {
+                error!("Open: wslpath failed: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            crate::command::command_with_limited_env("explorer.exe")
+                .arg(&win_path)
+                .spawn()
+        } else {
+            crate::command::command_with_limited_env(program)
+                .arg(path_str)
+                .spawn()
+        }
+        #[cfg(not(target_os = "linux"))]
+        crate::command::command_with_limited_env(program)
+            .arg(path_str)
+            .spawn()
+    };
+
+    spawn_result.map_err(|e| {
+        error!("Open: failed to spawn: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn stat_handler(Query(query): Query<StatParams>) -> Result<Json<StatResponse>, StatusCode> {
@@ -1060,12 +1189,16 @@ async fn which_handler(Json(params): Json<WhichParams>) -> Result<Json<WhichResp
     }
 }
 
-async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, StatusCode> {
+async fn about_handler(
+    Query(params): Query<AboutParams>,
+) -> Result<Json<AboutResponse>, StatusCode> {
     let cache_dir = dirs::cache_dir()
         .unwrap_or_else(|| std::env::temp_dir())
         .join("tidewave")
         .to_string_lossy()
-        .to_string();
+        .into_owned();
+
+    let recordings_dir = recordings_dir().to_string_lossy().into_owned();
 
     #[cfg(target_os = "windows")]
     {
@@ -1080,7 +1213,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
 
             if output.status.success() {
                 let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let response_body = AboutResponse {
+                return Ok(Json(AboutResponse {
                     name: "tidewave-cli".to_string(),
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     system: SystemInfo {
@@ -1091,16 +1224,8 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
                         wsl: true,
                     },
                     cache_dir,
-                };
-
-                let json_body = serde_json::to_string(&response_body)
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                return Response::builder()
-                    .header("Access-Control-Allow-Origin", "*")
-                    .header("Content-Type", "application/json")
-                    .body(Body::from(json_body))
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+                    recordings_dir,
+                }));
             };
 
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1109,7 +1234,7 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
 
     _ = params;
 
-    let response_body = AboutResponse {
+    Ok(Json(AboutResponse {
         name: "tidewave-cli".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         system: SystemInfo {
@@ -1120,16 +1245,8 @@ async fn about(Query(params): Query<AboutParams>) -> Result<Response<Body>, Stat
             wsl: false,
         },
         cache_dir,
-    };
-
-    let json_body =
-        serde_json::to_string(&response_body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    Response::builder()
-        .header("Access-Control-Allow-Origin", "*")
-        .header("Content-Type", "application/json")
-        .body(Body::from(json_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        recordings_dir,
+    }))
 }
 
 async fn check_origin_handler(req: Request) -> Result<Json<CheckOriginResponse>, StatusCode> {
@@ -1143,50 +1260,7 @@ async fn check_origin_handler(req: Request) -> Result<Json<CheckOriginResponse>,
     Ok(Json(CheckOriginResponse { valid }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-
-    #[test]
-    fn test_bind_addr_default() {
-        let addr = get_bind_addr(9832, false, None);
-        assert_eq!(addr, SocketAddr::from((Ipv4Addr::LOCALHOST, 9832)));
-    }
-
-    #[test]
-    fn test_bind_addr_remote_access() {
-        let addr = get_bind_addr(9832, true, None);
-        assert_eq!(addr, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 9832)));
-    }
-
-    #[test]
-    fn test_bind_addr_ipv6_literal() {
-        let addr = get_bind_addr(9832, false, Some("::1"));
-        assert_eq!(addr, SocketAddr::from((Ipv6Addr::LOCALHOST, 9832)));
-    }
-
-    #[test]
-    fn test_bind_addr_ipv6_brackets() {
-        let addr = get_bind_addr(9832, false, Some("[::1]"));
-        assert_eq!(addr, SocketAddr::from((Ipv6Addr::LOCALHOST, 9832)));
-    }
-
-    #[test]
-    fn test_bind_addr_ipv6_overrides_allow_remote() {
-        let addr = get_bind_addr(9832, true, Some("::1"));
-        assert_eq!(addr, SocketAddr::from((Ipv6Addr::LOCALHOST, 9832)));
-    }
-
-    #[test]
-    fn test_bind_addr_invalid_host_fallback() {
-        // Invalid host should log an error and fall back to localhost
-        let addr = get_bind_addr(9832, false, Some("not-an-ip"));
-        assert_eq!(addr, SocketAddr::from((Ipv4Addr::LOCALHOST, 9832)));
-    }
-}
-
-async fn root(_req: Request) -> Html<String> {
+async fn root_handler(_req: Request) -> Html<String> {
     let client_url =
         env::var("TIDEWAVE_CLIENT_URL").unwrap_or_else(|_| "https://tidewave.ai".to_string());
 
@@ -1199,6 +1273,17 @@ async fn root(_req: Request) -> Html<String> {
     <meta name="tidewave:source" content="cli" />
     <meta name="tidewave:version" content="{}" />
     <script type="module" src="{}/tc/tc.js"></script>
+    <script>
+      if ('serviceWorker' in navigator) {{
+        navigator.serviceWorker.register('/sw.js');
+      }}
+      if (/Chrome/.test(navigator.userAgent)) {{
+        const link = document.createElement('link');
+        link.rel = 'manifest';
+        link.href = '/manifest.json';
+        document.head.appendChild(link);
+      }}
+    </script>
   </head>
   <body></body>
 </html>"#,
@@ -1207,4 +1292,100 @@ async fn root(_req: Request) -> Html<String> {
     );
 
     Html(html)
+}
+
+async fn manifest_json_handler() -> Response<Body> {
+    let manifest = serde_json::json!({
+        "name": "Tidewave Web",
+        "short_name": "Tidewave Web",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#ffffff",
+        "theme_color": "#000000",
+        "description": "Tidewave Web",
+        "icons": [
+            {
+                "src": "/icon-192.png",
+                "sizes": "192x192",
+                "type": "image/png",
+                "purpose": "any maskable"
+            },
+            {
+                "src": "/icon-512.png",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any maskable"
+            }
+        ],
+        "protocol_handlers": [
+            {
+                "protocol": "web+tidewave",
+                "url": "/?pwa=%s"
+            }
+        ]
+    });
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/manifest+json")
+        .body(Body::from(manifest.to_string()))
+        .unwrap()
+}
+
+async fn service_worker_handler() -> Response<Body> {
+    let sw = r##"const OFFLINE_HTML = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tidewave</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: #0d1117; color: #fff; }
+    p { font-size: 1.1rem; text-align: center; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <p>Could not load <span id="url"></span><br>Ensure the Tidewave App (or CLI) is running in your menu bar and <a href="#" onclick="location.reload();return false" style="color:#fff">refresh</a>.</p>
+  <script>document.getElementById('url').textContent = location.href;</script>
+</body>
+</html>`;
+
+self.addEventListener('install', event => {
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener('fetch', event => {
+  if (event.request.mode === 'navigate') {
+    event.respondWith(
+      fetch(event.request).catch(() => new Response(OFFLINE_HTML, {
+        headers: { 'Content-Type': 'text/html' }
+      }))
+    );
+  }
+});"##;
+
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/javascript")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(sw))
+        .unwrap()
+}
+
+async fn icon_192_handler() -> Response<Body> {
+    let bytes = include_bytes!("../icons/pwa-192.png");
+    Response::builder()
+        .header(header::CONTENT_TYPE, "image/png")
+        .body(Body::from(bytes.as_slice()))
+        .unwrap()
+}
+
+async fn icon_512_handler() -> Response<Body> {
+    let bytes = include_bytes!("../icons/pwa-512.png");
+    Response::builder()
+        .header(header::CONTENT_TYPE, "image/png")
+        .body(Body::from(bytes.as_slice()))
+        .unwrap()
 }
