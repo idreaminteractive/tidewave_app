@@ -103,6 +103,15 @@ struct DeleteFileParams {
 }
 
 #[derive(Deserialize)]
+struct CopyParams {
+    from_path: String,
+    to_path: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    is_wsl: bool,
+}
+
+#[derive(Deserialize)]
 struct WhichParams {
     command: String,
     // Note that cwd is only used in case PATH in env is also set
@@ -204,6 +213,13 @@ enum WriteFileResponse {
 enum DeleteFileResponse {
     DeleteFileResponseOk { success: bool },
     DeleteFileResponseErr { success: bool, error: String },
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum CopyResponse {
+    CopyResponseOk { success: bool },
+    CopyResponseErr { success: bool, error: String },
 }
 
 #[derive(Serialize)]
@@ -388,6 +404,7 @@ async fn serve_http_server_inner(
         .route("/write", post(write_file_handler))
         .route("/delete", post(delete_file_handler))
         .route("/mkdir", post(mkdir_handler))
+        .route("/copy", post(copy_handler))
         .route("/shell", post(shell_handler))
         .route("/cmd", post(cmd_handler))
         .route("/which", post(which_handler))
@@ -876,6 +893,44 @@ async fn delete_file_handler(
         Err(error) => Ok(Json(DeleteFileResponse::DeleteFileResponseErr {
             success: false,
             error: error.kind().to_string(),
+        })),
+    }
+}
+
+async fn copy_handler(Json(payload): Json<CopyParams>) -> Result<Json<CopyResponse>, StatusCode> {
+    let from_path = match normalize_path(&payload.from_path, payload.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(CopyResponse::CopyResponseErr {
+                success: false,
+                error,
+            }));
+        }
+    };
+
+    let to_path = match normalize_path(&payload.to_path, payload.is_wsl).await {
+        Ok(path) => path,
+        Err(error) => {
+            return Ok(Json(CopyResponse::CopyResponseErr {
+                success: false,
+                error,
+            }));
+        }
+    };
+
+    if !Path::new(&from_path).is_absolute() || !Path::new(&to_path).is_absolute() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let result = tokio::fs::copy(&from_path, &to_path)
+        .await
+        .map_err(|e| e.kind().to_string());
+
+    match result {
+        Ok(_) => Ok(Json(CopyResponse::CopyResponseOk { success: true })),
+        Err(error) => Ok(Json(CopyResponse::CopyResponseErr {
+            success: false,
+            error,
         })),
     }
 }
