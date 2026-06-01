@@ -97,7 +97,7 @@ impl WatchFeatureState {
 struct JoinPayload {
     path: String,
     #[serde(default)]
-    is_wsl: bool,
+    wsl_distro: Option<String>,
 }
 
 /// Initialize a `watch:<ref>` channel.
@@ -119,7 +119,7 @@ pub async fn init(
     };
 
     // Normalize path (handles WSL path conversion on Windows)
-    let normalized_path = match normalize_path(&payload.path, payload.is_wsl).await {
+    let normalized_path = match normalize_path(&payload.path, payload.wsl_distro.as_deref()).await {
         Ok(p) => p,
         Err(e) => return InitResult::Error(format!("Failed to normalize path: {}", e)),
     };
@@ -164,7 +164,12 @@ pub async fn init(
         .is_ok();
 
     if should_start_watcher {
-        init_watcher(&state, &active_watch, &canonical_path, payload.is_wsl);
+        init_watcher(
+            &state,
+            &active_watch,
+            &canonical_path,
+            payload.wsl_distro.as_deref(),
+        );
     }
 
     // Send success reply
@@ -210,7 +215,7 @@ fn init_watcher(
     state: &WatchFeatureState,
     active_watch: &Arc<ActiveWatch>,
     canonical_path: &str,
-    is_wsl: bool,
+    wsl_distro: Option<&str>,
 ) {
     let tx = active_watch.tx.clone();
     let canonical_path = canonical_path.to_string();
@@ -219,10 +224,10 @@ fn init_watcher(
     // On Windows with WSL, use poll watcher directly since native watcher
     // doesn't work well with WSL paths
     #[cfg(target_os = "windows")]
-    let use_poll_watcher = is_wsl;
+    let use_poll_watcher = wsl_distro.is_some();
     #[cfg(not(target_os = "windows"))]
     let use_poll_watcher = {
-        let _ = is_wsl;
+        let _ = wsl_distro;
         false
     };
 
@@ -412,6 +417,35 @@ fn convert_notify_event(
                         } else {
                             // to_path is outside watched dir, clear any pending rename
                             pending_rename_from.take();
+                        }
+                    }
+                }
+                notify::event::RenameMode::Any => {
+                    // Any means that the path is a part of rename, but the backend does
+                    // not specify it it is "From" or "To". To detect it we check if the
+                    // given path exists.
+                    if let Some(path) = event.paths.first() {
+                        if path.exists() {
+                            // Path exists → treat as "To"
+                            if let Some(to_relative) = to_relative_path(path, watched_path) {
+                                if let Some(from_relative) = pending_rename_from.take() {
+                                    results.push(WatchEvent::FS(FsEvent::Renamed {
+                                        from: from_relative,
+                                        to: to_relative,
+                                    }));
+                                } else {
+                                    results.push(WatchEvent::FS(FsEvent::Created {
+                                        path: to_relative,
+                                    }));
+                                }
+                            } else if let Some(from_relative) = pending_rename_from.take() {
+                                results.push(WatchEvent::FS(FsEvent::Deleted {
+                                    path: from_relative,
+                                }));
+                            }
+                        } else {
+                            // Path gone → treat as "From"
+                            *pending_rename_from = to_relative_path(path, watched_path);
                         }
                     }
                 }
